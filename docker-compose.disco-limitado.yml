@@ -1,0 +1,14 @@
+# Sobreposição opcional: coloca os dados do banco de ORIGEM num tmpfs de tamanho fixo.
+#
+# Serve para observar, no Software B, o ponto em que o WAL retido pelo slot de replicação
+# esgota o disco e o banco passa a recusar escritas (Cenário 1). Sem ela, o limite é o
+# disco da máquina. Os dados ficam em memória e somem quando o contêiner é removido.
+#
+# Uso (os scripts Python herdam a variável):
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.disco-limitado.yml   # Linux/macOS
+#   $env:COMPOSE_FILE="docker-compose.yml;docker-compose.disco-limitado.yml"   # PowerShell
+#   ORIGEM_DISCO_LIMITE=1g docker compose up backend-change-data-capture
+services:
+  postgres-origem:
+    tmpfs:
+      - /var/lib/postgresql/data:size=${ORIGEM_DISCO_LIMITE:-1g},uid=999,gid=999

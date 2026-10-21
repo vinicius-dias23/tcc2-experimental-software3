@@ -1,0 +1,267 @@
+# Protótipos do TCC — Dataset 3 (RetailRocket, eventos de comportamento em e-commerce)
+#
+#   Software A (Domain Events, sem Outbox):  docker compose up backend-domain-events
+#   Software B (Change Data Capture/Debezium): docker compose up backend-change-data-capture
+#
+# Os dois compartilham os mesmos bancos, o mesmo cluster Kafka, o mesmo código Go e o
+# mesmo esquema; muda apenas o mecanismo de propagação. Não suba os dois ao mesmo tempo
+# (usam as mesmas portas). Para trocar: docker compose --profile domain-events --profile cdc down -v
+
+name: retailrocket-tcc
+
+x-both-profiles: &both-profiles ["domain-events", "cdc"]
+
+x-postgres: &postgres
+  image: postgres:16
+  profiles: *both-profiles
+  environment:
+    POSTGRES_USER: retailrocket
+    POSTGRES_PASSWORD: retailrocket
+    POSTGRES_DB: retailrocket
+    TZ: UTC
+  # wal_level=logical nos dois modos, para que o banco seja idêntico entre A e B.
+  # max_slot_wal_keep_size=-1 (padrão): o slot retém WAL sem limite, como no Cenário 1.
+  command: >
+    postgres -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+    -c max_slot_wal_keep_size=-1 -c max_connections=200 -c shared_buffers=256MB
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U retailrocket -d retailrocket"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+x-kafka: &kafka
+  image: apache/kafka:3.8.0
+  profiles: *both-profiles
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 10s
+    retries: 30
+    start_period: 10s
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: "cmV0YWlscm9ja2V0LXRjYzM"
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+
+x-app: &app
+  build: .
+  image: retailrocket-tcc/app:latest
+
+x-tracking-service: &tracking-service
+  <<: *app
+  command: ["/app/tracking-service"]
+  ports: ["8080:8080"]
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+  depends_on: &app-deps
+    postgres-origem: { condition: service_healthy }
+    postgres-destino: { condition: service_healthy }
+    seed: { condition: service_completed_successfully }
+    kafka-init: { condition: service_completed_successfully }
+
+x-analytics-service: &analytics-service
+  <<: *app
+  command: ["/app/analytics-service"]
+  ports: ["8081:8081"]
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz >/dev/null"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+  depends_on: *app-deps
+
+services:
+  # ---------------------------------------------------------------- infraestrutura comum
+  postgres-origem:
+    <<: *postgres
+    ports: ["5432:5432"]
+    volumes:
+      - ./db/origem:/docker-entrypoint-initdb.d:ro
+
+  postgres-destino:
+    <<: *postgres
+    ports: ["5433:5432"]
+    volumes:
+      - ./db/destino:/docker-entrypoint-initdb.d:ro
+
+  kafka-1:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+
+  kafka-2:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+
+  kafka-3:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    profiles: *both-profiles
+    entrypoint: ["/bin/bash", "/infra/create-topics.sh"]
+    environment:
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-6}
+    volumes:
+      - ./infra/kafka:/infra:ro
+    depends_on:
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+
+  # Carga inicial: parcela do dataset gravada direto nas duas bases.
+  seed:
+    <<: *app
+    profiles: *both-profiles
+    command: ["/app/seed"]
+    environment:
+      SEED_FRACTION: ${SEED_FRACTION:-0.7}
+      RETAILROCKET_MAX_OPS: ${RETAILROCKET_MAX_OPS:-1000000}
+    volumes:
+      - ${RETAILROCKET_DATA_DIR:-./data/retailrocket}:/data:ro
+    depends_on:
+      postgres-origem: { condition: service_healthy }
+      postgres-destino: { condition: service_healthy }
+
+  # ------------------------------------------------------ Software A — Domain Events
+  tracking-service-domain-events:
+    <<: *tracking-service
+    profiles: ["domain-events"]
+    environment:
+      PROPAGATION_MODE: domain-events
+      PUBLISH_TIMEOUT: ${PUBLISH_TIMEOUT:-5s}
+      PUBLISH_MAX_ATTEMPTS: ${PUBLISH_MAX_ATTEMPTS:-10}
+      PUBLISH_FAILURE_RESPONSE: ${PUBLISH_FAILURE_RESPONSE:-success}
+      # Retentativa em memória do evento que falhou na publicação síncrona (M1): tentativas,
+      # espera antes da primeira e multiplicador das seguintes. 0 tentativas desliga.
+      PUBLISH_RETRY_ATTEMPTS: ${PUBLISH_RETRY_ATTEMPTS:-3}
+      PUBLISH_RETRY_BACKOFF: ${PUBLISH_RETRY_BACKOFF:-1s}
+      PUBLISH_RETRY_MULTIPLIER: ${PUBLISH_RETRY_MULTIPLIER:-2}
+      PUBLISH_RETRY_BUFFER: ${PUBLISH_RETRY_BUFFER:-10000}
+
+  analytics-service-domain-events:
+    <<: *analytics-service
+    profiles: ["domain-events"]
+    environment:
+      PROPAGATION_MODE: domain-events
+      CONSUMER_WORKERS: ${CONSUMER_WORKERS:-3}
+
+  backend-domain-events:
+    image: alpine:3.20
+    profiles: ["domain-events"]
+    command: >
+      sh -c 'echo "Software A (Domain Events) no ar: API http://localhost:8080 | consumidor http://localhost:8081/metrics";
+      trap "exit 0" TERM INT; sleep infinity & wait'
+    depends_on:
+      tracking-service-domain-events: { condition: service_healthy }
+      analytics-service-domain-events: { condition: service_healthy }
+
+  # ---------------------------------------------- Software B — Change Data Capture
+  kafka-connect:
+    image: debezium/connect:2.7.3.Final
+    profiles: ["cdc"]
+    ports: ["8083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      GROUP_ID: retailrocket-connect
+      CONFIG_STORAGE_TOPIC: retailrocket_connect_configs
+      OFFSET_STORAGE_TOPIC: retailrocket_connect_offsets
+      STATUS_STORAGE_TOPIC: retailrocket_connect_statuses
+      OFFSET_FLUSH_INTERVAL_MS: ${CDC_OFFSET_FLUSH_INTERVAL_MS:-60000}
+      HEAP_OPTS: -Xms512m -Xmx1g
+      CONNECT_PRODUCER_ACKS: all
+      # Tempo que o produtor do Connect insiste em entregar um registro antes de falhar a
+      # tarefa. O padrão do Kafka (120000) derruba a tarefa em janelas longas; o valor
+      # máximo mantém a tarefa viva e deixa a mudança retida no WAL até a fila voltar.
+      CONNECT_PRODUCER_DELIVERY_TIMEOUT_MS: ${CDC_PRODUCER_DELIVERY_TIMEOUT_MS:-2147483647}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres-origem: { condition: service_healthy }
+
+  debezium-connector-init:
+    image: debezium/connect:2.7.3.Final
+    profiles: ["cdc"]
+    entrypoint: ["/bin/bash", "/infra/register-connector.sh"]
+    volumes:
+      - ./infra/debezium:/infra:ro
+    depends_on:
+      kafka-connect: { condition: service_healthy }
+      seed: { condition: service_completed_successfully }
+
+  # Reinício automático da tarefa do Debezium em FAILED (M4), com a mesma política de
+  # retentativa do Software A. 0 tentativas desliga (o vigia só registra a falha).
+  connect-watchdog:
+    <<: *app
+    profiles: ["cdc"]
+    command: ["/app/connect-watchdog"]
+    ports: ["8086:8086"]
+    environment:
+      CONNECTOR_NAME: retailrocket-origem
+      CONNECT_RESTART_ATTEMPTS: ${CONNECT_RESTART_ATTEMPTS:-3}
+      CONNECT_RESTART_BACKOFF: ${CONNECT_RESTART_BACKOFF:-1s}
+      CONNECT_RESTART_MULTIPLIER: ${CONNECT_RESTART_MULTIPLIER:-2}
+      CONNECT_RESTART_RESET_AFTER: ${CONNECT_RESTART_RESET_AFTER:-60s}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8086/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      debezium-connector-init: { condition: service_completed_successfully }
+
+  tracking-service-cdc:
+    <<: *tracking-service
+    profiles: ["cdc"]
+    environment:
+      PROPAGATION_MODE: cdc
+
+  analytics-service-cdc:
+    <<: *analytics-service
+    profiles: ["cdc"]
+    environment:
+      PROPAGATION_MODE: cdc
+      CONSUMER_WORKERS: ${CONSUMER_WORKERS:-3}
+
+  backend-change-data-capture:
+    image: alpine:3.20
+    profiles: ["cdc"]
+    command: >
+      sh -c 'echo "Software B (CDC/Debezium) no ar: API http://localhost:8080 | consumidor http://localhost:8081/metrics | Connect http://localhost:8083";
+      trap "exit 0" TERM INT; sleep infinity & wait'
+    depends_on:
+      tracking-service-cdc: { condition: service_healthy }
+      analytics-service-cdc: { condition: service_healthy }
+      debezium-connector-init: { condition: service_completed_successfully }
+      connect-watchdog: { condition: service_healthy }

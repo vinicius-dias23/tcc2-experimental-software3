@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Painel do protótipo</title>
+<link rel="stylesheet" href="/estatico/painel.css">
+</head>
+<body>
+<header class="topo">
+  <div>
+    <h1>Painel do protótipo · RetailRocket</h1>
+    <p class="sub">Domain Events × Change Data Capture sob falhas de disponibilidade</p>
+  </div>
+  <div class="topo-dir">
+    <span id="modo" class="modo">carregando…</span>
+    <span id="conexao" class="conexao" title="Atualização do painel">●</span>
+  </div>
+</header>
+
+<main class="grade">
+  <section class="cartao diagrama-cartao">
+    <div class="cartao-cab">
+      <h2>Serviços e dependências</h2>
+      <div class="legenda" aria-label="Legenda de estados">
+        <span><i class="bolinha ok"></i>no ar</span>
+        <span><i class="bolinha aviso"></i>iniciando ou degradado</span>
+        <span><i class="bolinha congelado"></i>congelado (pause)</span>
+        <span><i class="bolinha erro"></i>parado</span>
+        <span><i class="bolinha ausente"></i>não criado</span>
+      </div>
+    </div>
+    <div class="diagrama-rolagem"><svg id="diagrama" viewBox="0 0 1000 400" role="img" aria-label="Diagrama dos serviços"></svg></div>
+    <p class="dica">Clique num serviço para ver detalhes e injetar falha nele.</p>
+  </section>
+
+  <aside class="lateral">
+    <section class="cartao" id="detalhe">
+      <h2>Nenhum serviço selecionado</h2>
+      <p class="dica">Selecione um serviço no diagrama.</p>
+    </section>
+
+    <section class="cartao">
+      <h2>Injeção rápida de falhas</h2>
+      <label class="linha">Tipo de parada
+        <select id="parada">
+          <option value="stop">stop (SIGTERM)</option>
+          <option value="kill">kill (SIGKILL)</option>
+          <option value="pause">pause (congelado e inalcançável)</option>
+        </select>
+      </label>
+      <div class="botoes">
+        <button data-preset="fila" class="perigo">Derrubar a fila (3 brokers)</button>
+        <button data-preset="quorum" class="perigo">Tirar o quórum (2 brokers)</button>
+        <button data-preset="broker" class="perigo">Derrubar 1 broker</button>
+        <button data-preset="consumidor" class="perigo">Derrubar o consumidor</button>
+        <button data-preset="origem" class="perigo">Derrubar o banco de origem</button>
+        <button data-preset="destino" class="perigo">Derrubar o banco de destino</button>
+        <button data-preset="connect" class="perigo so-cdc">Derrubar o Debezium</button>
+        <button data-acao="conector" class="so-cdc">Reiniciar tarefa do conector</button>
+      </div>
+      <button id="restaurar" class="primario largo">Restaurar tudo</button>
+      <p id="aviso-falha" class="aviso-texto" hidden></p>
+    </section>
+  </aside>
+
+  <section class="cartao grafico-cartao">
+    <div class="cartao-cab">
+      <h2>Vazão por segundo · últimos 5 minutos</h2>
+      <div id="legenda-grafico" class="legenda"></div>
+    </div>
+    <div class="grafico-caixa">
+      <svg id="grafico" role="img" aria-label="Gráfico de vazão"></svg>
+      <div id="tooltip" class="tooltip" hidden></div>
+    </div>
+    <p class="dica">Faixas sombreadas: algum serviço fora do ar.</p>
+  </section>
+
+  <section class="cartao scripts">
+    <h2>Scripts</h2>
+    <details>
+      <summary>Subir ou trocar o backend</summary>
+      <p class="dica">Derruba tudo (inclusive as bases) e sobe o software escolhido.</p>
+      <div class="botoes">
+        <button data-ambiente="domain-events">Subir Software A (Domain Events)</button>
+        <button data-ambiente="cdc">Subir Software B (CDC)</button>
+      </div>
+    </details>
+    <details>
+      <summary>Gerar carga</summary>
+      <form id="form-carga" class="form">
+        <label>Perfil
+          <select name="perfil">
+            <option value="constante">constante</option>
+            <option value="rajada">rajada</option>
+            <option value="represamento">represamento</option>
+          </select>
+        </label>
+        <label data-perfil="constante">Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
+        <label data-perfil="constante">Duração (s) <input name="duracao" type="number" value="300" min="5"></label>
+        <label data-perfil="lote" hidden>Operações <input name="operacoes" type="number" value="10000" min="1"></label>
+        <label data-perfil="lote" hidden>Concorrência <input name="concorrencia" type="number" value="200" min="1"></label>
+        <p class="dica">Represamento: para o consumidor, envia as operações, religa e mede a drenagem do acúmulo (no CDC são três mensagens por evento de comportamento e duas por mudança de propriedade).</p>
+        <button type="submit" class="primario">Iniciar carga</button>
+      </form>
+    </details>
+    <details>
+      <summary>Executar o Cenário 1 (fila indisponível)</summary>
+      <form id="form-cenario1" class="form">
+        <label>Software
+          <select name="modo">
+            <option value="domain-events">A · Domain Events</option>
+            <option value="cdc">B · CDC</option>
+            <option value="ambos">ambos</option>
+          </select>
+        </label>
+        <label>Janela de falha (s) <input name="janela" type="number" value="60" min="5"></label>
+        <label>Regime antes (s) <input name="regime" type="number" value="30" min="0"></label>
+        <label>Recuperação (s) <input name="recuperacao" type="number" value="30" min="0"></label>
+        <label>Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
+        <label>Sem progresso (s) <input name="sem_progresso" type="number" value="300" min="10"></label>
+        <label>Parada
+          <select name="parada">
+            <option value="stop">stop</option><option value="kill">kill</option><option value="pause">pause</option>
+          </select>
+        </label>
+        <fieldset class="brokers">
+          <legend>Brokers derrubados</legend>
+          <label><input type="checkbox" name="brokers" value="kafka-1" checked> kafka-1</label>
+          <label><input type="checkbox" name="brokers" value="kafka-2" checked> kafka-2</label>
+          <label><input type="checkbox" name="brokers" value="kafka-3" checked> kafka-3</label>
+        </fieldset>
+        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> intervenção manual no conector se o reinício automático desistir (CDC)</label>
+        <p class="dica">Reinicializa o ambiente antes (down -v). Os resultados vão para resultados/cenario1/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
+        <button type="submit" class="primario">Executar Cenário 1</button>
+      </form>
+    </details>
+    <div id="trabalho" class="trabalho" hidden>
+      <div class="trabalho-cab">
+        <div><strong id="trabalho-desc"></strong><div id="trabalho-info" class="dica"></div></div>
+        <button id="trabalho-parar" class="perigo">Interromper</button>
+      </div>
+      <pre id="trabalho-saida"></pre>
+    </div>
+  </section>
+
+  <section class="cartao eventos-cartao">
+    <h2>Linha do tempo</h2>
+    <ol id="eventos" class="eventos"></ol>
+  </section>
+</main>
+<script src="/estatico/painel.js"></script>
+</body>
+</html>
