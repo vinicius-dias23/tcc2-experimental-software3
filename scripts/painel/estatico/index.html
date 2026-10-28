@@ -30,7 +30,7 @@
         <span><i class="bolinha ausente"></i>não criado</span>
       </div>
     </div>
-    <div class="diagrama-rolagem"><svg id="diagrama" viewBox="0 0 1000 400" role="img" aria-label="Diagrama dos serviços"></svg></div>
+    <div class="diagrama-rolagem"><svg id="diagrama" viewBox="0 0 1000 430" role="img" aria-label="Diagrama dos serviços"></svg></div>
     <p class="dica">Clique num serviço para ver detalhes e injetar falha nele.</p>
   </section>
 
@@ -58,6 +58,12 @@
         <button data-preset="destino" class="perigo">Derrubar o banco de destino</button>
         <button data-preset="connect" class="perigo so-cdc">Derrubar o Debezium</button>
         <button data-acao="conector" class="so-cdc">Reiniciar tarefa do conector</button>
+      </div>
+      <div class="botoes">
+        <button data-subir="replica" data-mostra="sem-replica">Subir a réplica da origem</button>
+        <button data-acao="failover" class="perigo" data-mostra="standby">Failover da origem (promover a réplica)</button>
+        <button data-subir="consumidores" data-mostra="sem-extras">Subir as instâncias 2 e 3 do consumidor</button>
+        <button data-preset="instancia" class="perigo" data-mostra="extras">Derrubar a instância 2 do consumidor</button>
       </div>
       <button id="restaurar" class="primario largo">Restaurar tudo</button>
       <p id="aviso-falha" class="aviso-texto" hidden></p>
@@ -134,6 +140,81 @@
         <p class="dica">Reinicializa o ambiente antes (down -v). Os resultados vão para resultados/cenario1/.</p>
         <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
         <button type="submit" class="primario">Executar Cenário 1</button>
+      </form>
+    </details>
+    <details>
+      <summary>Executar o Cenário 2 (promoção de réplica)</summary>
+      <form id="form-cenario2" class="form">
+        <label>Software
+          <select name="modo">
+            <option value="domain-events">A · Domain Events</option>
+            <option value="cdc">B · CDC</option>
+            <option value="ambos">ambos</option>
+          </select>
+        </label>
+        <label>Réplica isolada antes da queda (s) <input name="atraso_replicacao" type="number" value="5" min="0"></label>
+        <label>Queda até a promoção (s) <input name="atraso_promocao" type="number" value="5" min="0"></label>
+        <label>Regime antes (s) <input name="regime" type="number" value="30" min="0"></label>
+        <label>Recuperação (s) <input name="recuperacao" type="number" value="60" min="0"></label>
+        <label>Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
+        <label>Sem progresso (s) <input name="sem_progresso" type="number" value="300" min="10"></label>
+        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> intervenção manual no conector se o reinício automático desistir (CDC)</label>
+        <p class="dica">Sobe a réplica, tira-a da rede pelo tempo indicado (o que o primário commitar nesse intervalo não chega a ela), derruba o primário com SIGKILL e promove a réplica, que assume o nome postgres-origem. Resultados em resultados/cenario2/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
+        <button type="submit" class="primario">Executar Cenário 2</button>
+      </form>
+    </details>
+    <details>
+      <summary>Executar o Cenário 3 (reinícios repetidos)</summary>
+      <form id="form-cenario3" class="form">
+        <label>Software
+          <select name="modo">
+            <option value="domain-events">A · Domain Events</option>
+            <option value="cdc">B · CDC</option>
+            <option value="ambos">ambos</option>
+          </select>
+        </label>
+        <label>Duração dos ciclos (s) <input name="duracao_falha" type="number" value="600" min="10"></label>
+        <label>No ar entre mortes (s) <input name="tempo_no_ar" type="number" value="20" min="1"></label>
+        <label>Sinal
+          <select name="sinal"><option value="SIGKILL">SIGKILL</option><option value="SIGTERM">SIGTERM</option></select>
+        </label>
+        <label>Regime antes (s) <input name="regime" type="number" value="30" min="0"></label>
+        <label>Recuperação (s) <input name="recuperacao" type="number" value="60" min="0"></label>
+        <label>Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
+        <label>Sem progresso (s) <input name="sem_progresso" type="number" value="300" min="10"></label>
+        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> intervenção manual no conector se o reinício automático desistir (CDC)</label>
+        <p class="dica">Mata e religa o componente de propagação em ciclos: o tracking-service no A, o Kafka Connect no B. No B, o tempo no ar precisa ser menor que o intervalo de gravação de offsets (60 s). Resultados em resultados/cenario3/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
+        <button type="submit" class="primario">Executar Cenário 3</button>
+      </form>
+    </details>
+    <details>
+      <summary>Executar o Cenário 5 (queda de consumidor)</summary>
+      <form id="form-cenario5" class="form">
+        <label>Software
+          <select name="modo">
+            <option value="domain-events">A · Domain Events</option>
+            <option value="cdc">B · CDC</option>
+            <option value="ambos">ambos</option>
+          </select>
+        </label>
+        <label>max.poll.interval (ms) <input name="max_poll_interval_ms" type="number" value="1000" min="10"></label>
+        <label>Mensagens por lote <input name="max_poll_records" type="number" value="500" min="1"></label>
+        <label>Instância 2 fora do ar (s) <input name="janela" type="number" value="60" min="1"></label>
+        <label>Parada
+          <select name="parada"><option value="kill">kill</option><option value="stop">stop</option><option value="pause">pause</option></select>
+        </label>
+        <label>Regime antes (s) <input name="regime" type="number" value="60" min="0"></label>
+        <label>Recuperação (s) <input name="recuperacao" type="number" value="120" min="0"></label>
+        <label>Taxa (ops/s) <input name="taxa" type="number" value="300" min="1"></label>
+        <label>Sem progresso (s) <input name="sem_progresso" type="number" value="300" min="10"></label>
+        <p class="dica">Três instâncias do analytics-service, com dois membros do grupo cada, lendo em lotes. Calibre antes: a calibração represa a fila e mede quanto tempo leva um lote cheio em cada software. Resultados em resultados/cenario5/.</p>
+        <div class="botoes">
+          <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
+          <button type="submit" class="primario">Executar Cenário 5</button>
+          <button type="submit" data-calibrar="1">Calibrar o max.poll.interval</button>
+        </div>
       </form>
     </details>
     <div id="trabalho" class="trabalho" hidden>
