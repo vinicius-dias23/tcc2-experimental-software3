@@ -51,6 +51,12 @@ type consumer struct {
 	db   *pgxpool.Pool
 
 	consumed, applied, invalid, dbErrors *atomic.Int64
+
+	// Modo de leitura em lotes (Cenário 5). Com maxPollInterval zero, o consumidor lê uma
+	// mensagem por vez, como nos demais cenários.
+	maxPollRecords                                                           int
+	maxPollInterval                                                          time.Duration
+	batches, batchMsSum, batchMsMax, fullBatches, fullBatchMsSum, expulsions *atomic.Int64
 }
 
 func main() {
@@ -79,7 +85,17 @@ func main() {
 		applied:  reg.Counter("messages_applied_total", "mensagens que alteraram a projeção"),
 		invalid:  reg.Counter("messages_invalid_total", "mensagens que não puderam ser decodificadas"),
 		dbErrors: reg.Counter("db_errors_total", "falhas ao gravar no banco de destino (com nova tentativa)"),
+
+		maxPollRecords:  config.Int("CONSUMER_MAX_POLL_RECORDS", 500),
+		maxPollInterval: config.Duration("CONSUMER_MAX_POLL_INTERVAL", 0),
+		batches:         reg.Counter("poll_batches_total", "lotes processados (modo em lotes)"),
+		batchMsSum:      reg.Counter("poll_batch_ms_sum", "soma do tempo de processamento dos lotes (ms)"),
+		batchMsMax:      reg.Counter("poll_batch_ms_max", "maior tempo de processamento de um lote desde o início (ms)"),
+		fullBatches:     reg.Counter("poll_full_batches_total", "lotes que atingiram CONSUMER_MAX_POLL_RECORDS"),
+		fullBatchMsSum:  reg.Counter("poll_full_batch_ms_sum", "soma do tempo de processamento dos lotes cheios (ms)"),
+		expulsions:      reg.Counter("group_expulsions_total", "vezes em que um lote passou de CONSUMER_MAX_POLL_INTERVAL e o membro saiu do grupo"),
 	}
+	groups := &kafka.Client{Addr: kafka.TCP(brokers...), Timeout: 3 * time.Second}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +106,32 @@ func main() {
 		fmt.Fprintf(w, `{"status":"ok","mode":%q}`, mode)
 	})
 	mux.Handle("GET /metrics", reg.Handler())
+	// Estado do grupo de consumo, lido do coordenador: usado pelo Cenário 5 e pelo painel
+	// para contar rebalanceamentos e medir o tempo fora do estado Stable.
+	mux.HandleFunc("GET /group", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		resp, err := groups.DescribeGroups(ctx, &kafka.DescribeGroupsRequest{GroupIDs: []string{groupID}})
+		if err == nil && len(resp.Groups) == 0 {
+			err = errors.New("grupo não encontrado")
+		}
+		if err == nil {
+			err = resp.Groups[0].Error
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		g := resp.Groups[0]
+		hosts := map[string]int{}
+		for _, m := range g.Members {
+			hosts[m.ClientHost]++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"group": groupID, "state": g.GroupState, "members": len(g.Members), "members_by_host": hosts,
+		})
+	})
 	go func() {
 		addr := config.String("HTTP_ADDR", ":8081")
 		if err := http.ListenAndServe(addr, mux); err != nil {
@@ -98,23 +140,33 @@ func main() {
 	}()
 
 	log.Printf("analytics-service consumindo %v (grupo %s, %d workers, modo %s)", topics, groupID, workers, mode)
+	if c.maxPollInterval > 0 {
+		log.Printf("leitura em lotes: até %d mensagens por lote, max.poll.interval %s", c.maxPollRecords, c.maxPollInterval)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			r := kafka.NewReader(kafka.ReaderConfig{
-				Brokers:        brokers,
-				GroupID:        groupID,
-				GroupTopics:    topics,
-				MinBytes:       1,
-				MaxBytes:       10 << 20,
-				MaxWait:        500 * time.Millisecond,
-				StartOffset:    kafka.FirstOffset,
-				CommitInterval: config.Duration("CONSUMER_COMMIT_INTERVAL", time.Second),
-				SessionTimeout: config.Duration("CONSUMER_SESSION_TIMEOUT", 10*time.Second),
-				ErrorLogger:    kafka.LoggerFunc(throttledLogger(fmt.Sprintf("worker %d: ", id))),
-			})
+			newReader := func() *kafka.Reader {
+				return kafka.NewReader(kafka.ReaderConfig{
+					Brokers:        brokers,
+					GroupID:        groupID,
+					GroupTopics:    topics,
+					MinBytes:       1,
+					MaxBytes:       10 << 20,
+					MaxWait:        500 * time.Millisecond,
+					StartOffset:    kafka.FirstOffset,
+					CommitInterval: config.Duration("CONSUMER_COMMIT_INTERVAL", time.Second),
+					SessionTimeout: config.Duration("CONSUMER_SESSION_TIMEOUT", 10*time.Second),
+					ErrorLogger:    kafka.LoggerFunc(throttledLogger(fmt.Sprintf("worker %d: ", id))),
+				})
+			}
+			if c.maxPollInterval > 0 {
+				c.runBatches(ctx, id, newReader)
+				return
+			}
+			r := newReader()
 			defer r.Close()
 			c.run(ctx, r)
 		}(i)
@@ -135,8 +187,78 @@ func (c *consumer) run(ctx context.Context, r *kafka.Reader) {
 		}
 		c.consumed.Add(1)
 		c.handle(ctx, msg)
+		if ctx.Err() != nil {
+			// Encerramento (SIGTERM): handle pode ter desistido sem gravar, então o offset não
+			// pode avançar; a mensagem é reentregue a quem assumir a partição.
+			return
+		}
 		// Commit assíncrono (CommitInterval): entrega pelo menos uma vez.
 		if err := r.CommitMessages(ctx, msg); err != nil && ctx.Err() == nil {
+			log.Printf("erro registrando offset: %v", err)
+		}
+	}
+}
+
+// runBatches reproduz o ciclo poll/processa/confirma de um consumidor Java, que o kafka-go
+// não tem: busca até maxPollRecords mensagens já disponíveis, processa o lote e só então
+// registra os offsets. Se o processamento passar de maxPollInterval, o membro sai do grupo
+// no instante em que o limite vence (como o heartbeat do cliente Java faz), o que dispara
+// um rebalanceamento; os offsets do lote não são confirmados e as mensagens são reentregues.
+func (c *consumer) runBatches(ctx context.Context, id int, newReader func() *kafka.Reader) {
+	r := newReader()
+	defer func() { r.Close() }()
+	for {
+		msg, err := r.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("erro lendo a fila: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		start := time.Now()
+		var expired atomic.Bool
+		current := r
+		timer := time.AfterFunc(c.maxPollInterval, func() {
+			expired.Store(true)
+			current.Close() // LeaveGroup imediato, enquanto o lote ainda está em processamento
+		})
+		batch := []kafka.Message{msg}
+		for len(batch) < c.maxPollRecords {
+			fctx, cancel := context.WithTimeout(ctx, time.Millisecond)
+			m, err := r.FetchMessage(fctx)
+			cancel()
+			if err != nil {
+				break
+			}
+			batch = append(batch, m)
+		}
+		for _, m := range batch {
+			c.consumed.Add(1)
+			c.handle(ctx, m)
+		}
+		timer.Stop()
+		if ctx.Err() != nil {
+			return // encerramento no meio do lote: nada é confirmado, como em run
+		}
+		ms := time.Since(start).Milliseconds()
+		c.batches.Add(1)
+		c.batchMsSum.Add(ms)
+		if len(batch) == c.maxPollRecords {
+			c.fullBatches.Add(1)
+			c.fullBatchMsSum.Add(ms)
+		}
+		for cur := c.batchMsMax.Load(); ms > cur && !c.batchMsMax.CompareAndSwap(cur, ms); cur = c.batchMsMax.Load() {
+		}
+		if expired.Load() {
+			c.expulsions.Add(1)
+			log.Printf("worker %d: lote de %d mensagens levou %d ms (limite %s); saiu do grupo e vai entrar de novo",
+				id, len(batch), ms, c.maxPollInterval)
+			r = newReader()
+			continue
+		}
+		if err := r.CommitMessages(ctx, batch...); err != nil && ctx.Err() == nil {
 			log.Printf("erro registrando offset: %v", err)
 		}
 	}

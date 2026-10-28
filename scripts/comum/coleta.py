@@ -36,6 +36,16 @@ class Coletor:
         self.destino: psycopg.AsyncConnection | None = None
         self.dsn = {"origem": ORIGEM_DSN, "destino": DESTINO_DSN}
 
+    async def trocar_origem(self, dsn: str) -> None:
+        """Passa a ler a origem em outro endereço (Cenário 2: réplica promovida a primário)."""
+        if self.origem is not None and not self.origem.closed:
+            try:
+                await self.origem.close()
+            except Exception:
+                pass
+        self.origem = None
+        self.dsn["origem"] = dsn
+
     async def conectar(self) -> None:
         self.destino = await psycopg.AsyncConnection.connect(DESTINO_DSN, autocommit=True)
         cur = await self.destino.execute("SELECT coalesce(max(id), 0) FROM received_events")
